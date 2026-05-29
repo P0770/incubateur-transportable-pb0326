@@ -1,7 +1,7 @@
 // =============================================================
 //  PB-0326 — Incubateur transportable pour cellules mammifères
 //  HEPIA HES-SO — Groupe 3 : Lyla Founas, Mattéo Pozzo di Borgo
-//  Version : 3.0 — Mai 2026
+//  Version : 3.1 — Mai 2026
 // =============================================================
 //
 //  DESCRIPTION GÉNÉRALE :
@@ -16,6 +16,7 @@
 //  Machine à états principale à 6 états (0→5) :
 //    0 - INIT            : initialisation matérielle
 //    1 - CHECK_CAPTEURS  : vérification présence I2C (3 tentatives)
+//                          → validation par bouton GO avant de continuer
 //    2 - ATTENTE_DONNEES : validation plages capteurs
 //    3 - BUFFER          : attente appui bouton GO
 //    4 - MARCHE          : régulation active
@@ -23,12 +24,19 @@
 //
 //  CAPTEURS RETENUS :
 //    - SHT35  (I2C 0x44) : température + humidité → bibliothèque Adafruit
-//    - SCD40  (I2C 0x62) : CO₂                   → lecture I2C brute Wire
+//    - SCD40  (I2C 0x62) : CO₂ → DÉSACTIVÉ (commenté, à réactiver)
 //
 //  ACTIONNEURS :
 //    - Peltier TEC1-12703 : chauffage seul (MOSFET Grove, ON/OFF)
 //    - Ventilateur        : ON si T > 37.5°C (dissipation passive)
-//    - Électrovanne V114  : injection CO₂ impulsionnelle
+//    - Électrovanne V114  : CO₂ → DÉSACTIVÉE (co2Actif = false)
+//
+//  MODIFICATION v3.1 :
+//    - Partie CO₂/SCD40 mise en commentaire (réactivable)
+//    - lireCapteurs() limité à 1 appel toutes les INTERVALLE_LECTURE ms
+//    - CHECK_CAPTEURS : affichage résultat + attente bouton GO
+//      avant de passer à l'état suivant
+//    - Broches corrigées (évite GPIO input-only et flash SPI)
 //
 // =============================================================
 
@@ -38,128 +46,151 @@
 
 // =============================================================
 //  BROCHES GPIO — Attribution finale sans conflit
-//  I2C : SDA=21, SCL=22 (défaut ESP32, réservés)
+//  I2C  : SDA=21, SCL=22 (défaut ESP32, réservés)
+//  EVITER: 6-11 (flash SPI), 34/35/36/39 (input only)
 // =============================================================
-#define BROCHE_PELTIER 39
-#define BROCHE_VENTILATEUR 12  // Ventilateur dissipateur (ON/OFF)
-#define BROCHE_SOLENOIDE 14    // Électrovanne V114 via MOSFET IRLZ44N
-#define BROCHE_LED_ROUGE 10    // LED alerte erreur (clignotante en état 5)
-#define BROCHE_BOUTON_GO 5     // Bouton démarrage transport (INPUT_PULLUP)
+#define BROCHE_PELTIER      32   // MOSFET Grove Peltier — chauffage ON/OFF
+#define BROCHE_VENTILATEUR  25   // Ventilateur dissipateur (ON/OFF)
+#define BROCHE_SOLENOIDE    27   // Électrovanne V114 via MOSFET — CO₂ DÉSACTIVÉ
+#define BROCHE_LED_ROUGE    26   // LED alerte erreur (clignotante en état 5)
+#define BROCHE_BOUTON_GO    5   // Bouton démarrage transport (INPUT_PULLUP)
 
 // =============================================================
 //  CONSIGNES BIOLOGIQUES
 //  Valeurs cibles pour maintien de la viabilité cellulaire
 // =============================================================
-#define CONSIGNE_TEMP 37.0f    // Température cible en °C
-#define SEUIL_CHAUFFE 36.5f    // En dessous → Peltier chauffe
-#define SEUIL_REFROIDIT 37.5f  // Au dessus  → Peltier refroidit
-#define TEMP_SECURITE 40.0f    // Sécurité absolue → passage ERREUR
+#define CONSIGNE_TEMP   37.0f  // Température cible en °C
+#define SEUIL_CHAUFFE   36.5f  // En dessous → Peltier chauffe
+#define SEUIL_REFROIDIT 37.5f  // Au dessus  → Peltier OFF + ventilateur
+#define TEMP_SECURITE   40.0f  // Sécurité absolue → passage ERREUR
 
-#define CONSIGNE_CO2 5.0f    // CO₂ cible en %
-#define SEUIL_BAS_CO2 4.7f   // En dessous → injection CO₂
-#define SEUIL_HAUT_CO2 5.3f  // Au dessus  → attente dilution naturelle
+// --- CO₂ : paramètres conservés mais non utilisés (SCD40 désactivé) ---
+#define CONSIGNE_CO2    5.0f   // CO₂ cible en %
+#define SEUIL_BAS_CO2   4.7f   // En dessous → injection CO₂
+#define SEUIL_HAUT_CO2  5.3f   // Au dessus  → attente dilution naturelle
 
 #define SEUIL_HR_ALERTE 85.0f  // En dessous → alerte enceinte ouverte
 
 // =============================================================
 //  PARAMÈTRES RÉGULATION CO₂
-//  Temporisations pour éviter oscillations (inertie diffusion CO₂)
+//  Conservés en commentaire — réactiver avec SCD40
 // =============================================================
-#define DUREE_INJECT_MS 200        // Durée ouverture électrovanne (ms) — à calibrer
-#define DUREE_STABILISATION 30000  // Attente post-injection avant nouvelle mesure (ms)
-#define INTERVALLE_CO2 5000        // Cadence lecture SCD40 (ms) — temps mesure SCD40
+#define DUREE_INJECT_MS     200    // Durée ouverture électrovanne (ms) — à calibrer
+#define DUREE_STABILISATION 30000  // Attente post-injection (ms)
+#define INTERVALLE_CO2      5000   // Cadence lecture SCD40 (ms)
 
 // =============================================================
 //  PARAMÈTRES AFFICHAGE & DIVERS
 // =============================================================
-#define INTERVALLE_ECRAN 2000  // Rafraîchissement écran TFT (ms)
-#define DUREE_INIT 3000        // Durée état INIT (ms)
-#define TENTATIVES_I2C 3       // Nombre de tentatives scan I2C avant erreur
-#define DELAI_RETRY_I2C 50     // Délai entre tentatives I2C (ms)
+#define INTERVALLE_ECRAN   2000  // Rafraîchissement écran TFT (ms)
+#define INTERVALLE_LECTURE 2000  // Cadence lecture capteurs (ms) — anti-spam
+#define DUREE_INIT         3000  // Durée état INIT (ms)
+#define TENTATIVES_I2C        3  // Nombre de tentatives scan I2C avant erreur
+#define DELAI_RETRY_I2C      50  // Délai entre tentatives I2C (ms)
 
 // =============================================================
 //  ÉTATS MACHINE PRINCIPALE
 // =============================================================
-#define ETAT_INIT 0             // Initialisation matérielle
-#define ETAT_CHECK_CAPTEURS 1   // Vérification présence capteurs I2C
+#define ETAT_INIT            0  // Initialisation matérielle
+#define ETAT_CHECK_CAPTEURS  1  // Vérification présence capteurs I2C
 #define ETAT_ATTENTE_DONNEES 2  // Validation plages de valeurs capteurs
-#define ETAT_BUFFER 3           // Attente appui bouton GO par l'opérateur
-#define ETAT_MARCHE 4           // Régulation active — transport en cours
-#define ETAT_ERREUR 5           // Erreur critique — tout éteint
+#define ETAT_BUFFER          3  // Attente appui bouton GO par l'opérateur
+#define ETAT_MARCHE          4  // Régulation active — transport en cours
+#define ETAT_ERREUR          5  // Erreur critique — tout éteint
 
 // =============================================================
 //  ÉTATS INTERNES RÉGULATION CO₂
-//  Sous-machine à états non bloquante pour injection CO₂
+//  Conservés — sous-machine inactive tant que co2Actif = false
 // =============================================================
-#define CO2_IDLE 0         // En attente, lecture périodique active
-#define CO2_INJECTING 1    // Électrovanne ouverte, injection en cours
+#define CO2_IDLE        0  // En attente, lecture périodique active
+#define CO2_INJECTING   1  // Électrovanne ouverte, injection en cours
 #define CO2_STABILIZING 2  // Post-injection, attente diffusion CO₂
 
 // =============================================================
 //  ADRESSES I2C CAPTEURS
 // =============================================================
 #define ADRESSE_SHT35 0x44  // Adresse I2C SHT35 (défaut)
-#define ADRESSE_SCD40 0x62  // Adresse I2C SCD40 (défaut)
+#define ADRESSE_SCD40 0x62  // Adresse I2C SCD40 (défaut) — DÉSACTIVÉ
 
 // =============================================================
-//  COMMANDES SCD40 (protocole I2C brut, commandes 16 bits)
+//  COMMANDES SCD40 — DÉSACTIVÉES (SCD40 non branché)
+//  Décommenter quand SCD40 disponible
 // =============================================================
 #define SCD40_CMD_START_MEAS 0x21B1  // Démarrer mesure périodique
-#define SCD40_CMD_READ_MEAS 0xEC05   // Lire mesure courante
-#define SCD40_CMD_STOP_MEAS 0x3F86   // Arrêter mesure périodique
+#define SCD40_CMD_READ_MEAS  0xEC05  // Lire mesure courante
+#define SCD40_CMD_STOP_MEAS  0x3F86  // Arrêter mesure périodique
 
 // =============================================================
 //  OBJETS
 // =============================================================
-TFT_eSPI ecran = TFT_eSPI();              // Écran TFT (SPI, bibliothèque TFT_eSPI)
-Adafruit_SHT31 sht35 = Adafruit_SHT31();  // Capteur SHT35 (I2C, bibliothèque Adafruit)
+TFT_eSPI       ecran = TFT_eSPI();       // Écran TFT (SPI, bibliothèque TFT_eSPI)
+Adafruit_SHT31 sht35 = Adafruit_SHT31(); // Capteur SHT35 (I2C, bibliothèque Adafruit)
 
 // =============================================================
 //  VARIABLES GLOBALES — ÉTAT SYSTÈME
 // =============================================================
 
 // --- Machine à états principale ---
-int etat = ETAT_INIT;    // État courant de la machine principale
-int etatPrecedent = -1;  // Mémorise l'état précédent pour détecter les transitions
+int etat          = ETAT_INIT;  // État courant de la machine principale
+int etatPrecedent = -1;         // Mémorise l'état précédent pour détecter les transitions
 
 // --- Valeurs capteurs (mises à jour par lireCapteurs()) ---
 float temperature = 25.0f;  // Température mesurée par SHT35 (°C)
-float humidite = 50.0f;     // Humidité relative mesurée par SHT35 (%)
-float co2 = 0.0f;           // Concentration CO₂ mesurée par SCD40 (%)
+float humidite    = 50.0f;  // Humidité relative mesurée par SHT35 (%)
+float co2         =  5.0f;  // CO₂ — valeur fixe 5.0% car SCD40 désactivé
+                             // ⚠️ Remettre à 0.0f quand SCD40 réactivé
+
+// --- Timer lecture capteurs (anti-spam) ---
+// lireCapteurs() n'est appelé que toutes les INTERVALLE_LECTURE ms
+// Évite la saturation du bus I2C et du port série
+unsigned long derniereLecture = 0;
 
 // --- État régulation CO₂ ---
-int etatCO2 = CO2_IDLE;        // Sous-état de la régulation CO₂
-unsigned long timerCO2 = 0;    // Horodatage dernier événement CO₂ (ms)
-unsigned long dernierCO2 = 0;  // Horodatage dernière lecture CO₂ (ms)
+// Sous-machine conservée mais inactive (co2Actif = false)
+int           etatCO2    = CO2_IDLE;  // Sous-état de la régulation CO₂
+unsigned long timerCO2   = 0;         // Horodatage dernier événement CO₂ (ms)
+unsigned long dernierCO2 = 0;         // Horodatage dernière lecture CO₂ (ms)
 
 // --- Timers non bloquants ---
 unsigned long dernierEcran = 0;  // Horodatage dernier rafraîchissement TFT (ms)
-unsigned long tempsInit = 0;     // Horodatage début état INIT (ms)
+unsigned long tempsInit    = 0;  // Horodatage début état INIT (ms)
 
-// --- Flags ---
+// --- Flags capteurs ---
 bool sht35Operationnel = false;  // true si SHT35 détecté et initialisé
-bool scd40Demarre = false;       // true si SCD40 en mesure périodique active
-bool alerteHR = false;           // true si HR sous seuil d'alerte (enceinte ouverte ?)
+
+// --- Flag CO₂ : DÉSACTIVÉ — passer à true quand SCD40 branché ---
+// Tant que false : miseAJourCO2() retourne immédiatement sans rien faire
+// La vanne reste fermée (sécurité par défaut V114 NC)
+bool co2Actif = false;  // ⚠️ Mettre à true pour activer la régulation CO₂
+
+// --- Flag SCD40 démarré ---
+// DÉSACTIVÉ — laisser false tant que SCD40 non branché
+bool scd40Demarre = false;  // ⚠️ Mis à true par scd40Demarrer() quand réactivé
+
+// --- Flag humidité ---
+bool alerteHR = false;  // true si HR sous seuil d'alerte (enceinte ouverte ?)
+
+// --- Flag résultat scan I2C (utilisé dans CHECK_CAPTEURS) ---
+// Mémorise le résultat du scan pour affichage et validation bouton
+bool scanEffectue    = false;  // true si le scan I2C a déjà été fait dans cet état
+bool scanSHT35OK     = false;  // Résultat scan SHT35
+bool scanSCD40OK     = false;  // Résultat scan SCD40 (toujours false si désactivé)
 
 // =============================================================
 //  SETUP — Initialisation unique au démarrage
 // =============================================================
 void setup() {
   Serial.begin(115200);
-  Serial.println("=== PB-0326 Firmware v3.0 ===");
+  Serial.println("=== PB-0326 Firmware v3.1 ===");
 
   // --- Configuration broches de sortie ---
+  pinMode(BROCHE_PELTIER,     OUTPUT);
   pinMode(BROCHE_VENTILATEUR, OUTPUT);
-  pinMode(BROCHE_SOLENOIDE, OUTPUT);
-  pinMode(BROCHE_LED_ROUGE, OUTPUT);
+  pinMode(BROCHE_SOLENOIDE,   OUTPUT);
+  pinMode(BROCHE_LED_ROUGE,   OUTPUT);
 
   // --- Configuration broche d'entrée ---
   pinMode(BROCHE_BOUTON_GO, INPUT_PULLUP);  // Résistance pull-up interne activée
-
-  // --- Configuration PWM Peltier ---
-  // Canal 0, fréquence 5kHz, résolution 8 bits (0-255)
-  // NOUVEAU v3.x
-  pinMode(BROCHE_PELTIER, OUTPUT);
 
   // --- Sécurité : tout éteindre avant toute chose ---
   toutEteindre();
@@ -173,8 +204,10 @@ void setup() {
   // --- Initialisation SHT35 via bibliothèque Adafruit ---
   sht35Demarrer();
 
-  // --- Démarrage SCD40 en mesure périodique ---
-  scd40Demarrer();
+  // --- SCD40 : DÉSACTIVÉ ---
+  // Décommenter les deux lignes suivantes pour réactiver le SCD40 :
+  // scd40Demarrer();
+  // delay(5000);  // Attente première mesure SCD40 disponible
 
   // --- Initialisation écran TFT ---
   ecran.init();
@@ -193,15 +226,23 @@ void setup() {
 // =============================================================
 void loop() {
 
-  // --- Lecture capteurs à chaque itération ---
-  // (SHT35 et SCD40 ont leur propre gestion du timing interne)
-  lireCapteurs();
+  // --- Lecture capteurs cadencée (toutes les INTERVALLE_LECTURE ms) ---
+  // Remplace l'appel direct à chaque itération qui saturait le bus I2C
+  // et le port série avec des milliers de messages d'erreur SCD40
+  if (millis() - derniereLecture >= INTERVALLE_LECTURE) {
+    lireCapteurs();
+    derniereLecture = millis();
+  }
 
   // --- Affichage TFT uniquement lors d'un changement d'état ---
   // Évite les redessins inutiles qui ralentissent la boucle
   if (etat != etatPrecedent) {
     afficherEcran(etat);
     etatPrecedent = etat;
+    // Réinitialiser le flag scan si on quitte CHECK_CAPTEURS
+    if (etat != ETAT_CHECK_CAPTEURS) {
+      scanEffectue = false;
+    }
     Serial.printf("[ÉTAT] Transition → %d\n", etat);
   }
 
@@ -221,30 +262,57 @@ void loop() {
 
     // ----------------------------------------------------------
     //  ÉTAT 1 — CHECK CAPTEURS
-    //  Vérifie la présence I2C de SHT35 et SCD40
-    //  3 tentatives par capteur avant passage en ERREUR
+    //
+    //  Déroulement en deux phases :
+    //
+    //  Phase 1 — Scan automatique (une seule fois à l'entrée) :
+    //    Scanne SHT35 et SCD40 (3 tentatives chacun)
+    //    Affiche le résultat sur TFT et Serial
+    //    Met à jour scanSHT35OK et scanSCD40OK
+    //
+    //  Phase 2 — Attente bouton GO :
+    //    L'opérateur lit le résultat sur l'écran
+    //    Appui GO :
+    //      Si SHT35 OK → passe à ATTENTE_DONNEES
+    //      Si SHT35 KO → passe en ERREUR (capteur principal manquant)
+    //    SCD40 absent n'est pas bloquant (co2Actif reste false)
     // ----------------------------------------------------------
     case ETAT_CHECK_CAPTEURS:
-      if (verifierCapteursI2C()) {
-        Serial.println("[CHECK] Capteurs OK → ATTENTE_DONNEES");
-        etat = ETAT_ATTENTE_DONNEES;
-      } else {
-        signalerErreur("Capteur absent");
+
+      // Phase 1 : scan I2C (exécuté une seule fois à l'entrée de l'état)
+      if (!scanEffectue) {
+        verifierCapteursI2C();  // Scan + affichage TFT + mise à jour flags
+        scanEffectue = true;
+        Serial.println("[CHECK] Résultat affiché — appuyez GO pour continuer");
+      }
+
+      // Phase 2 : attente bouton GO pour valider et passer à la suite
+      if (digitalRead(BROCHE_BOUTON_GO) == LOW) {
+        delay(50);  // Anti-rebond
+        if (digitalRead(BROCHE_BOUTON_GO) == LOW) {
+          if (scanSHT35OK) {
+            Serial.println("[CHECK] GO validé — SHT35 OK → ATTENTE_DONNEES");
+            etat = ETAT_ATTENTE_DONNEES;
+          } else {
+            Serial.println("[CHECK] GO validé — SHT35 ABSENT → ERREUR");
+            signalerErreur("SHT35 requis");
+          }
+        }
       }
       break;
 
     // ----------------------------------------------------------
     //  ÉTAT 2 — ATTENTE DONNÉES
-    //  Valide que les capteurs retournent des valeurs plausibles
-    //  (élimine les lectures parasites au démarrage)
+    //  Valide que le SHT35 retourne des valeurs plausibles
+    //  CO₂ non validé (SCD40 désactivé, co2 = 5.0f fixe)
     // ----------------------------------------------------------
     case ETAT_ATTENTE_DONNEES:
-      if (temperature > 10.0f && temperature < 45.0f && humidite > 0.0f && co2 >= 0.0f) {
+      if (temperature > 10.0f && temperature < 45.0f && humidite > 0.0f) {
         Serial.println("[DONNÉES] Valides → BUFFER");
         etat = ETAT_BUFFER;
       } else {
-        Serial.printf("[DONNÉES] Invalides — T=%.1f HR=%.1f CO2=%.2f\n",
-                      temperature, humidite, co2);
+        Serial.printf("[DONNÉES] Invalides — T=%.1f HR=%.1f\n",
+                      temperature, humidite);
         signalerErreur("Donnees invalides");
       }
       break;
@@ -267,18 +335,18 @@ void loop() {
         if (digitalRead(BROCHE_BOUTON_GO) == LOW) {
           Serial.println("[BUFFER] GO appuyé → MARCHE");
           // Initialisation timers régulation
-          dernierCO2 = millis();
+          dernierCO2   = millis();
           dernierEcran = millis();
-          etatCO2 = CO2_IDLE;
-          etat = ETAT_MARCHE;
+          etatCO2      = CO2_IDLE;
+          etat         = ETAT_MARCHE;
         }
       }
       break;
 
     // ----------------------------------------------------------
     //  ÉTAT 4 — MARCHE
-    //  Régulation active des 3 paramètres biologiques
-    //  Toutes les fonctions de régulation sont non bloquantes
+    //  Régulation active température + humidité
+    //  CO₂ désactivé (miseAJourCO2 retourne immédiatement)
     // ----------------------------------------------------------
     case ETAT_MARCHE:
 
@@ -293,7 +361,8 @@ void loop() {
       // Régulation thermique bang-bang (Peltier + ventilateur)
       regulerTemperature();
 
-      // Régulation CO₂ (électrovanne V114, non bloquant)
+      // Régulation CO₂ — retourne immédiatement si co2Actif = false
+      // Vanne reste fermée (V114 NC = sécurité par défaut)
       miseAJourCO2();
 
       // Monitoring humidité passive (alerte si enceinte ouverte)
@@ -317,9 +386,9 @@ void loop() {
       // Clignotement LED rouge non bloquant (période 500ms)
       {
         static unsigned long dernierBlink = 0;
-        static bool ledActive = false;
+        static bool          ledActive    = false;
         if (millis() - dernierBlink >= 500) {
-          ledActive = !ledActive;
+          ledActive    = !ledActive;
           digitalWrite(BROCHE_LED_ROUGE, ledActive ? HIGH : LOW);
           dernierBlink = millis();
         }
@@ -347,6 +416,7 @@ void sht35Demarrer() {
 
 // =============================================================
 //  SCD40 — Envoi commande I2C brute
+//  DÉSACTIVÉ — fonction conservée pour réactivation future
 //
 //  Envoie une commande 16 bits au SCD40 via le bus I2C.
 //  Le SCD40 attend les commandes en big-endian (MSB en premier).
@@ -355,30 +425,34 @@ void sht35Demarrer() {
 //    cmd — commande 16 bits (ex. SCD40_CMD_START_MEAS = 0x21B1)
 // =============================================================
 void scd40EnvoyerCommande(uint16_t cmd) {
-  Wire.beginTransmission(ADRESSE_SCD40);
-  Wire.write((uint8_t)(cmd >> 8));    // Octet de poids fort (MSB)
-  Wire.write((uint8_t)(cmd & 0xFF));  // Octet de poids faible (LSB)
-  Wire.endTransmission();
+  // ⚠️ DÉSACTIVÉ — décommenter quand SCD40 branché
+  // Wire.beginTransmission(ADRESSE_SCD40);
+  // Wire.write((uint8_t)(cmd >> 8));    // Octet de poids fort (MSB)
+  // Wire.write((uint8_t)(cmd & 0xFF));  // Octet de poids faible (LSB)
+  // Wire.endTransmission();
 }
 
 // =============================================================
 //  SCD40 — Démarrage mesure périodique
+//  DÉSACTIVÉ — fonction conservée pour réactivation future
 //
-//  Envoie la commande START_PERIODIC_MEASUREMENT au SCD40.
-//  Après cette commande, le SCD40 produit une nouvelle mesure
-//  toutes les 5 secondes. La première mesure est disponible
-//  après un délai minimum de 5s.
-//
-//  Met à jour le flag scd40Demarre.
+//  Pour réactiver :
+//    1. Décommenter le corps de cette fonction
+//    2. Décommenter scd40Demarrer() dans setup()
+//    3. Passer co2Actif = true
+//    4. Remettre co2 = 0.0f dans les variables globales
+//    5. Décommenter le scan SCD40 dans verifierCapteursI2C()
 // =============================================================
 void scd40Demarrer() {
-  scd40EnvoyerCommande(SCD40_CMD_START_MEAS);
-  scd40Demarre = true;
-  Serial.println("[SCD40] Mesure périodique démarrée");
+  // ⚠️ DÉSACTIVÉ — décommenter quand SCD40 branché
+  // scd40EnvoyerCommande(SCD40_CMD_START_MEAS);
+  // scd40Demarre = true;
+  // Serial.println("[SCD40] Mesure périodique démarrée");
 }
 
 // =============================================================
 //  SCD40 — Calcul CRC-8 (obligatoire pour validation données)
+//  CONSERVÉ — utilisé dès que SCD40 réactivé
 //
 //  Le protocole SCD40 impose une vérification CRC-8 sur chaque
 //  paire d'octets de données. Polynôme : 0x31, valeur init : 0xFF.
@@ -388,17 +462,12 @@ void scd40Demarrer() {
 //    len  — nombre d'octets à inclure dans le calcul
 //
 //  Retourne : CRC calculé (uint8_t)
-//
-//  Usage : comparer avec l'octet CRC reçu du SCD40
-//    if (calculerCRC(data, 2) != data[2]) → erreur CRC
 // =============================================================
 uint8_t calculerCRC(uint8_t* data, uint8_t len) {
-  uint8_t crc = 0xFF;  // Valeur initiale imposée par le protocole SCD40
+  uint8_t crc = 0xFF;
   for (uint8_t i = 0; i < len; i++) {
     crc ^= data[i];
     for (uint8_t b = 0; b < 8; b++) {
-      // Si bit de poids fort = 1 → XOR avec polynôme 0x31
-      // Sinon → décalage simple
       crc = (crc & 0x80) ? ((crc << 1) ^ 0x31) : (crc << 1);
     }
   }
@@ -407,86 +476,48 @@ uint8_t calculerCRC(uint8_t* data, uint8_t len) {
 
 // =============================================================
 //  SCD40 — Lecture mesure (I2C brute)
+//  DÉSACTIVÉE — fonction conservée pour réactivation future
 //
-//  Demande et lit les 9 octets de mesure du SCD40 :
-//    Bytes 0-1 : CO₂ brut (uint16, big-endian)
-//    Byte  2   : CRC CO₂
-//    Bytes 3-4 : température brute (uint16, big-endian)
-//    Byte  5   : CRC température
-//    Bytes 6-7 : humidité brute (uint16, big-endian)
-//    Byte  8   : CRC humidité
-//
-//  Conversions appliquées :
-//    CO₂ (ppm)  = valeur brute (direct)
-//    Temp (°C)  = -45 + 175 × (raw / 65535)
-//    Hum  (%)   = 100 × (raw / 65535)
-//
-//  Paramètres (par référence, mis à jour si lecture réussie) :
-//    co2_out  — concentration CO₂ en ppm
-//    temp_out — température en °C
-//    hum_out  — humidité relative en %
-//
-//  Retourne : true si lecture et CRC valides, false sinon
+//  Pour réactiver : décommenter le corps de la fonction
+//  et suivre les instructions de scd40Demarrer()
 // =============================================================
 bool scd40Lire(float& co2_out, float& temp_out, float& hum_out) {
+  // ⚠️ DÉSACTIVÉ — décommenter quand SCD40 branché
+  //
+  // scd40EnvoyerCommande(SCD40_CMD_READ_MEAS);
+  // delay(1);
+  // Wire.requestFrom((uint8_t)ADRESSE_SCD40, (uint8_t)9);
+  // if (Wire.available() < 9) {
+  //   Serial.println("[SCD40] Erreur — données insuffisantes");
+  //   return false;
+  // }
+  // uint8_t data[9];
+  // for (uint8_t i = 0; i < 9; i++) { data[i] = Wire.read(); }
+  // if (calculerCRC(data,     2) != data[2]) { return false; }
+  // if (calculerCRC(data + 3, 2) != data[5]) { return false; }
+  // if (calculerCRC(data + 6, 2) != data[8]) { return false; }
+  // uint16_t raw_co2  = ((uint16_t)data[0] << 8) | data[1];
+  // uint16_t raw_temp = ((uint16_t)data[3] << 8) | data[4];
+  // uint16_t raw_hum  = ((uint16_t)data[6] << 8) | data[7];
+  // co2_out  = (float)raw_co2;
+  // temp_out = -45.0f + 175.0f * (raw_temp / 65535.0f);
+  // hum_out  = 100.0f * (raw_hum  / 65535.0f);
+  // Serial.printf("[SCD40] CO₂=%.0fppm  T=%.1f°C  HR=%.1f%%\n", co2_out, temp_out, hum_out);
+  // return true;
 
-  // Envoyer commande de lecture
-  scd40EnvoyerCommande(SCD40_CMD_READ_MEAS);
-  delay(1);  // Temps de traitement interne SCD40 (minimum 1ms)
-
-  // Demander 9 octets au SCD40
-  Wire.requestFrom((uint8_t)ADRESSE_SCD40, (uint8_t)9);
-
-  // Vérifier disponibilité des données
-  if (Wire.available() < 9) {
-    Serial.println("[SCD40] Erreur — données insuffisantes");
-    return false;
-  }
-
-  // Lire les 9 octets
-  uint8_t data[9];
-  for (uint8_t i = 0; i < 9; i++) {
-    data[i] = Wire.read();
-  }
-
-  // --- Vérification CRC sur chaque paire d'octets ---
-  if (calculerCRC(data, 2) != data[2]) {
-    Serial.println("[SCD40] CRC CO₂ invalide");
-    return false;
-  }
-  if (calculerCRC(data + 3, 2) != data[5]) {
-    Serial.println("[SCD40] CRC température invalide");
-    return false;
-  }
-  if (calculerCRC(data + 6, 2) != data[8]) {
-    Serial.println("[SCD40] CRC humidité invalide");
-    return false;
-  }
-
-  // --- Reconstruction valeurs brutes 16 bits (big-endian) ---
-  uint16_t raw_co2 = ((uint16_t)data[0] << 8) | data[1];
-  uint16_t raw_temp = ((uint16_t)data[3] << 8) | data[4];
-  uint16_t raw_hum = ((uint16_t)data[6] << 8) | data[7];
-
-  // --- Conversions selon datasheet SCD40 ---
-  co2_out = (float)raw_co2;                            // ppm (direct)
-  temp_out = -45.0f + 175.0f * (raw_temp / 65535.0f);  // °C
-  hum_out = 100.0f * (raw_hum / 65535.0f);             // %
-
-  Serial.printf("[SCD40] CO₂=%.0fppm  T=%.1f°C  HR=%.1f%%\n",
-                co2_out, temp_out, hum_out);
-  return true;
+  return false;  // Retourne toujours false tant que désactivé
 }
 
 // =============================================================
 //  LECTURE CAPTEURS — Point d'entrée unique
 //
-//  Lit SHT35 (température + humidité) et SCD40 (CO₂).
-//  Si une lecture échoue, les dernières valeurs connues
-//  sont conservées (pas de mise à zéro intempestive).
+//  Appelée toutes les INTERVALLE_LECTURE ms (2s) depuis loop()
+//  via le timer derniereLecture — évite la saturation du bus I2C
 //
-//  Note : co2 est stocké en % (co2_ppm / 10000)
-//    5% CO₂ = 50 000 ppm → 50000 / 10000 = 5.0
+//  Active : SHT35 (température + humidité)
+//  Inactif : SCD40 (co2 reste à valeur fixe 5.0f)
+//
+//  Pour réactiver SCD40 : décommenter le bloc marqué ⚠️
 // =============================================================
 void lireCapteurs() {
 
@@ -497,19 +528,22 @@ void lireCapteurs() {
 
     // isnan() détecte une erreur de lecture Adafruit (retourne NaN si échec)
     if (!isnan(t)) temperature = t;
-    if (!isnan(h)) humidite = h;
+    if (!isnan(h)) humidite    = h;
+
+    Serial.printf("[SHT35] T=%.1f°C  HR=%.1f%%\n", temperature, humidite);
   }
 
-  // --- SCD40 — CO₂ (lecture toutes les ~5s, cadence interne SCD40) ---
-  if (scd40Demarre) {
-    float co2_ppm, temp_scd, hum_scd;
-    if (scd40Lire(co2_ppm, temp_scd, hum_scd)) {
-      // Conversion ppm → % pour cohérence avec les seuils définis
-      co2 = co2_ppm / 10000.0f;
-    }
-    // Température et humidité SCD40 non utilisées
-    // (SHT35 est le capteur de référence pour ces grandeurs)
-  }
+  // --- SCD40 — CO₂ : DÉSACTIVÉ ---
+  // Pour réactiver : décommenter le bloc suivant
+  // ET passer co2Actif = true dans les variables globales
+  //
+  // ⚠️ DÉSACTIVÉ
+  // if (scd40Demarre) {
+  //   float co2_ppm, temp_scd, hum_scd;
+  //   if (scd40Lire(co2_ppm, temp_scd, hum_scd)) {
+  //     co2 = co2_ppm / 10000.0f;  // Conversion ppm → %
+  //   }
+  // }
 }
 
 // =============================================================
@@ -519,7 +553,7 @@ void lireCapteurs() {
 //  Effectue jusqu'à 'tentatives' essais avec un délai entre chaque.
 //
 //  Paramètres :
-//    adresse   — adresse I2C 7 bits du périphérique
+//    adresse    — adresse I2C 7 bits du périphérique
 //    tentatives — nombre maximum de tentatives (recommandé : 3)
 //
 //  Retourne : true si le périphérique répond (ACK reçu), false sinon
@@ -536,16 +570,14 @@ bool scannerAdresse(uint8_t adresse, uint8_t tentatives) {
     uint8_t erreur = Wire.endTransmission();
 
     if (erreur == 0) {
-      // Périphérique détecté
-      return true;
+      return true;  // Périphérique détecté
     }
 
     Serial.printf("[I2C] Tentative %d/%d addr=0x%02X erreur=%d\n",
                   i + 1, tentatives, adresse, erreur);
 
-    // Attente avant prochaine tentative (sauf la dernière)
     if (i < tentatives - 1) {
-      delay(DELAI_RETRY_I2C);
+      delay(DELAI_RETRY_I2C);  // Attente avant prochaine tentative
     }
   }
   return false;  // Toutes les tentatives ont échoué
@@ -554,58 +586,57 @@ bool scannerAdresse(uint8_t adresse, uint8_t tentatives) {
 // =============================================================
 //  VÉRIFICATION CAPTEURS I2C
 //
-//  Scanne les adresses I2C du SHT35 (0x44) et SCD40 (0x62).
-//  3 tentatives par capteur avant de déclarer l'absence.
-//  Affiche le résultat détaillé sur le TFT.
+//  Scanne SHT35 (obligatoire) et SCD40 (optionnel, désactivé).
+//  Met à jour les flags globaux scanSHT35OK et scanSCD40OK.
+//  Affiche le résultat sur TFT via afficherResultatI2C().
 //
-//  Retourne : true si les DEUX capteurs sont présents, false sinon
+//  Le passage à l'état suivant N'EST PAS décidé ici —
+//  c'est le bouton GO dans ETAT_CHECK_CAPTEURS qui valide.
 //
-//  Appelée dans ETAT_CHECK_CAPTEURS.
-//  En cas de false → signalerErreur() → ETAT_ERREUR.
+//  SCD40 : scan commenté → scanSCD40OK = false systématiquement
+//  Pour réactiver le scan SCD40 : décommenter le bloc marqué ⚠️
 // =============================================================
-bool verifierCapteursI2C() {
+void verifierCapteursI2C() {
 
   Serial.println("[I2C] Scan en cours...");
 
-  // Scan SHT35
-  bool sht35Trouve = scannerAdresse(ADRESSE_SHT35, TENTATIVES_I2C);
+  // --- Scan SHT35 (obligatoire) ---
+  scanSHT35OK = scannerAdresse(ADRESSE_SHT35, TENTATIVES_I2C);
   Serial.printf("[I2C] SHT35 [0x%02X] → %s\n",
-                ADRESSE_SHT35, sht35Trouve ? "OK" : "ABSENT");
+                ADRESSE_SHT35, scanSHT35OK ? "OK" : "ABSENT");
 
-  // Scan SCD40
-  bool scd40Trouve = 1;
-  //bool scd40Trouve = scannerAdresse(ADRESSE_SCD40, TENTATIVES_I2C);
-  //Serial.printf("[I2C] SCD40 [0x%02X] → %s\n",
-  //              ADRESSE_SCD40, scd40Trouve ? "OK" : "ABSENT");
+  // --- Scan SCD40 : DÉSACTIVÉ ---
+  // Pour réactiver : décommenter les 3 lignes suivantes
+  // ET passer co2Actif = true si détecté
+  //
+  // ⚠️ DÉSACTIVÉ
+  // scanSCD40OK = scannerAdresse(ADRESSE_SCD40, TENTATIVES_I2C);
+  // Serial.printf("[I2C] SCD40 [0x%02X] → %s\n",
+  //               ADRESSE_SCD40, scanSCD40OK ? "OK" : "ABSENT");
+  // if (scanSCD40OK) co2Actif = true;
+
+  scanSCD40OK = false;  // Toujours false tant que SCD40 désactivé
+
+  // Met à jour sht35Operationnel pour lireCapteurs()
+  sht35Operationnel = scanSHT35OK;
 
   // Affichage résultat sur TFT
-  afficherResultatI2C(sht35Trouve, scd40Trouve);
-
-  // Les deux doivent être présents pour continuer
-  return sht35Trouve && scd40Trouve;
+  afficherResultatI2C(scanSHT35OK, scanSCD40OK);
 }
 
 // =============================================================
 //  RÉGULATION THERMIQUE — Bang-bang avec zone morte
 //
-//  Contrôle le Peltier TEC1-12703 et le ventilateur selon
-//  la température mesurée par le SHT35.
+//  Contrôle le Peltier TEC1-12703 (chauffage seul, MOSFET Grove)
+//  et le ventilateur selon la température mesurée par le SHT35.
 //
 //  Logique :
-//    T < SEUIL_CHAUFFE   (36.5°C) → Peltier chauffe   + Ventilateur OFF
-//    T > SEUIL_REFROIDIT (37.5°C) → Peltier refroidit + Ventilateur ON
-//    Zone neutre [36.5 - 37.5°C]  → Tout OFF
+//    T < SEUIL_CHAUFFE   (36.5°C) → Peltier ON  + Ventilateur OFF
+//    T > SEUIL_REFROIDIT (37.5°C) → Peltier OFF + Ventilateur ON
+//    Zone neutre [36.5 - 37.5°C]  → Peltier OFF + Ventilateur OFF
 //
-//  Direction Peltier (pont en H) :
-//    Chauffe    : IN1=HIGH, IN2=LOW
-//    Refroidit  : IN1=LOW,  IN2=HIGH
-//    Éteint     : IN1=LOW,  IN2=LOW, PWM=0
-//
-//  Ventilateur ON pendant refroidissement :
-//    Évacue la chaleur côté dissipateur pour maintenir
-//    l'efficacité du Peltier en mode refroidissement.
-//  Ventilateur OFF pendant chauffage :
-//    Évite de dissiper la chaleur produite côté enceinte.
+//  Note : pas de refroidissement actif (MOSFET = 1 sens uniquement)
+//  Le ventilateur en mode "trop chaud" assure une dissipation passive.
 //
 //  Appelée en continu dans ETAT_MARCHE.
 //  La sécurité T > TEMP_SECURITE est gérée dans loop() avant appel.
@@ -614,91 +645,75 @@ void regulerTemperature() {
 
   if (temperature < SEUIL_CHAUFFE) {
     // --- Chauffe ---
-    digitalWrite(BROCHE_PELTIER, HIGH);
+    digitalWrite(BROCHE_PELTIER,     HIGH);
     digitalWrite(BROCHE_VENTILATEUR, LOW);
     Serial.printf("[THERM] Chauffe — T=%.1f°C\n", temperature);
 
   } else if (temperature > SEUIL_REFROIDIT) {
-    // --- Trop chaud — dissipation passive ---
-    digitalWrite(BROCHE_PELTIER, LOW);
+    // --- Trop chaud — dissipation passive ventilateur ---
+    digitalWrite(BROCHE_PELTIER,     LOW);
     digitalWrite(BROCHE_VENTILATEUR, HIGH);
     Serial.printf("[THERM] Trop chaud — T=%.1f°C\n", temperature);
 
   } else {
-    // --- Zone neutre ---
-    digitalWrite(BROCHE_PELTIER, LOW);
+    // --- Zone neutre [36.5 - 37.5°C] ---
+    digitalWrite(BROCHE_PELTIER,     LOW);
     digitalWrite(BROCHE_VENTILATEUR, LOW);
   }
 }
 
 // =============================================================
 //  RÉGULATION CO₂ — Injection impulsionnelle non bloquante
+//  DÉSACTIVÉE via flag co2Actif = false
 //
-//  Sous-machine à états à 3 niveaux :
+//  Retourne immédiatement si co2Actif = false.
+//  La vanne reste fermée (V114 NC = sécurité par défaut).
 //
-//  CO2_IDLE :
-//    Lecture toutes les INTERVALLE_CO2 ms (5s = cadence SCD40).
-//    Si co2 < SEUIL_BAS_CO2 → ouvre électrovanne → CO2_INJECTING.
-//    Si co2 > SEUIL_HAUT_CO2 → attente dilution naturelle (rien).
+//  Pour réactiver :
+//    1. Passer co2Actif = true
+//    2. Brancher et activer SCD40 (voir scd40Demarrer)
 //
-//  CO2_INJECTING :
-//    Électrovanne V114 ouverte pendant DUREE_INJECT_MS (200ms).
-//    Après → fermeture vanne → CO2_STABILIZING.
-//
-//  CO2_STABILIZING :
-//    Attente DUREE_STABILISATION ms (30s) pour laisser le CO₂
-//    se diffuser dans l'enceinte et le SCD40 se stabiliser.
-//    Évite les oscillations dues à l'inertie de diffusion.
-//    Après → retour CO2_IDLE.
-//
-//  Électrovanne V114 NC (Normally Closed) :
-//    GPIO HIGH → vanne ouvre → CO₂ injecté
-//    GPIO LOW  → vanne fermée → CO₂ bloqué (sécurité par défaut)
-//
-//  Appelée en continu dans ETAT_MARCHE.
+//  Sous-machine CO2_IDLE → CO2_INJECTING → CO2_STABILIZING
+//  conservée intacte pour réactivation sans réécriture.
 // =============================================================
 void miseAJourCO2() {
+
+  // ⚠️ DÉSACTIVÉ — retour immédiat tant que SCD40 non branché
+  // La vanne reste LOW (V114 NC fermée = aucune injection)
+  if (!co2Actif) return;
+
   unsigned long maintenant = millis();
 
   switch (etatCO2) {
 
-    // --- En attente, décision périodique ---
     case CO2_IDLE:
       if (maintenant - dernierCO2 >= INTERVALLE_CO2) {
         dernierCO2 = maintenant;
         Serial.printf("[CO₂] Lecture : %.2f%%\n", co2);
 
         if (co2 < SEUIL_BAS_CO2) {
-          // CO₂ insuffisant → ouvrir électrovanne
           digitalWrite(BROCHE_SOLENOIDE, HIGH);
           timerCO2 = maintenant;
-          etatCO2 = CO2_INJECTING;
+          etatCO2  = CO2_INJECTING;
           Serial.printf("[CO₂] Injection déclenchée (%.2f%% < %.2f%%)\n",
                         co2, SEUIL_BAS_CO2);
-
         } else if (co2 > SEUIL_HAUT_CO2) {
-          // CO₂ trop élevé → dilution naturelle, rien à faire
           Serial.printf("[CO₂] Trop élevé — dilution naturelle (%.2f%%)\n", co2);
         }
-        // Zone cible [4.7 - 5.3%] → aucune action
       }
       break;
 
-    // --- Injection en cours ---
     case CO2_INJECTING:
       if (maintenant - timerCO2 >= DUREE_INJECT_MS) {
-        // Durée d'injection atteinte → fermer vanne
         digitalWrite(BROCHE_SOLENOIDE, LOW);
         timerCO2 = maintenant;
-        etatCO2 = CO2_STABILIZING;
+        etatCO2  = CO2_STABILIZING;
         Serial.println("[CO₂] Vanne fermée → stabilisation 30s");
       }
       break;
 
-    // --- Post-injection, attente diffusion ---
     case CO2_STABILIZING:
       if (maintenant - timerCO2 >= DUREE_STABILISATION) {
-        // Stabilisation terminée → retour en veille
         etatCO2 = CO2_IDLE;
         Serial.println("[CO₂] Stabilisation terminée → IDLE");
       }
@@ -727,13 +742,11 @@ void miseAJourCO2() {
 void miseAJourHumidite() {
   if (humidite < SEUIL_HR_ALERTE) {
     if (!alerteHR) {
-      // Première détection → logger
       alerteHR = true;
       Serial.printf("[HR] ALERTE — HR=%.1f%% < %.1f%% — enceinte ouverte ?\n",
                     humidite, SEUIL_HR_ALERTE);
     }
   } else {
-    // HR revenue à la normale
     if (alerteHR) {
       alerteHR = false;
       Serial.printf("[HR] Alerte levée — HR=%.1f%%\n", humidite);
@@ -745,18 +758,18 @@ void miseAJourHumidite() {
 //  TOUT ÉTEINDRE — Mise en sécurité complète
 //
 //  Éteint tous les actionneurs dans un état sûr :
-//    - Peltier : direction neutre, PWM=0
+//    - Peltier  : OFF
 //    - Ventilateur : OFF
-//    - Électrovanne V114 : fermée (LOW = NC fermée = sécurité)
+//    - Électrovanne V114 : LOW (NC fermée = sécurité)
 //    - LED rouge : OFF
 //
 //  Appelée dans setup(), signalerErreur() et ETAT_ERREUR.
 // =============================================================
 void toutEteindre() {
-  digitalWrite(BROCHE_PELTIER, LOW);
+  digitalWrite(BROCHE_PELTIER,     LOW);
   digitalWrite(BROCHE_VENTILATEUR, LOW);
-  digitalWrite(BROCHE_SOLENOIDE, LOW);  // V114 NC → fermée = sécurité
-  digitalWrite(BROCHE_LED_ROUGE, LOW);
+  digitalWrite(BROCHE_SOLENOIDE,   LOW);  // V114 NC → fermée = sécurité
+  digitalWrite(BROCHE_LED_ROUGE,   LOW);
 }
 
 // =============================================================
@@ -767,7 +780,6 @@ void toutEteindre() {
 //
 //  Paramètre :
 //    message — chaîne C décrivant la cause de l'erreur
-//              (affiché Serial, visible dans les logs de debug)
 //
 //  Depuis ETAT_ERREUR, seul un reset matériel permet de redémarrer.
 // =============================================================
@@ -783,20 +795,20 @@ void signalerErreur(const char* message) {
 //
 //  Affiche l'état de détection de chaque capteur I2C :
 //    - SHT35 [0x44] : OK (vert) ou ABSENT (rouge)
-//    - SCD40 [0x62] : OK (vert) ou ABSENT (rouge)
-//    - Résultat global : SYSTÈME OK ou ERREUR
+//    - SCD40 [0x62] : DESACTIVE (gris) ou OK (vert) si réactivé
+//    - Résultat global + instruction "Appuyez GO"
 //
 //  Paramètres :
 //    sht35 — true si SHT35 détecté
-//    scd40 — true si SCD40 détecté
+//    scd40 — true si SCD40 détecté (toujours false actuellement)
 // =============================================================
 void afficherResultatI2C(bool sht35, bool scd40) {
-  ecran.fillScreen(0x1E9F);  // Fond bleu-vert
+  ecran.fillScreen(0x1E9F);
   ecran.setTextDatum(MC_DATUM);
 
   ecran.setTextColor(TFT_WHITE, 0x1E9F);
   ecran.setTextSize(2);
-  ecran.drawString("Capteurs I2C", 120, 40);
+  ecran.drawString("Capteurs I2C", 120, 30);
 
   ecran.setTextSize(1);
 
@@ -804,34 +816,35 @@ void afficherResultatI2C(bool sht35, bool scd40) {
   ecran.setTextColor(sht35 ? TFT_GREEN : TFT_RED, 0x1E9F);
   ecran.drawString(sht35 ? "SHT35  [0x44]  OK"
                          : "SHT35  [0x44]  ABSENT",
-                   120, 95);
+                   120, 85);
 
-  // SCD40
-  ecran.setTextColor(scd40 ? TFT_GREEN : TFT_RED, 0x1E9F);
+  // SCD40 — affiché comme désactivé tant que commenté
+  ecran.setTextColor(scd40 ? TFT_GREEN : 0xC618, 0x1E9F);  // 0xC618 = gris
   ecran.drawString(scd40 ? "SCD40  [0x62]  OK"
-                         : "SCD40  [0x62]  ABSENT",
-                   120, 125);
+                         : "SCD40  [0x62]  DESACTIVE",
+                   120, 110);
 
   // Résultat global
   ecran.setTextSize(2);
-  if (sht35 && scd40) {
+  if (sht35) {
     ecran.setTextColor(TFT_GREEN, 0x1E9F);
-    ecran.drawString("SYSTEME OK", 120, 185);
+    ecran.drawString("SHT35 OK", 120, 155);
   } else {
     ecran.setTextColor(TFT_RED, 0x1E9F);
-    ecran.drawString("ERREUR CAPTEUR", 120, 185);
+    ecran.drawString("SHT35 ABSENT", 120, 155);
   }
+
+  // Instruction bouton
+  ecran.setTextSize(1);
+  ecran.setTextColor(TFT_WHITE, 0x1E9F);
+  ecran.drawString("Appuyez GO pour continuer", 120, 200);
 }
 
 // =============================================================
 //  AFFICHAGE ÉCRAN TFT — Dispatcher principal
 //
 //  Redessine l'écran complet selon l'état courant.
-//  Chaque état a sa couleur de fond distinctive pour
-//  identification visuelle rapide.
-//
-//  Paramètre :
-//    e — état à afficher (ETAT_INIT à ETAT_ERREUR)
+//  Chaque état a sa couleur de fond distinctive.
 //
 //  Couleurs par état :
 //    INIT            : bleu marine  (TFT_NAVY)
@@ -847,7 +860,6 @@ void afficherEcran(int e) {
 
   switch (e) {
 
-    // --- INIT : écran de démarrage ---
     case ETAT_INIT:
       ecran.fillScreen(TFT_NAVY);
       ecran.setTextColor(TFT_WHITE, TFT_NAVY);
@@ -859,18 +871,16 @@ void afficherEcran(int e) {
       ecran.drawString("Initialisation...", 120, 160);
       break;
 
-    // --- CHECK CAPTEURS ---
     case ETAT_CHECK_CAPTEURS:
+      // Cet écran est géré par afficherResultatI2C()
+      // appelé depuis verifierCapteursI2C()
+      // Affichage générique pendant le scan
       ecran.fillScreen(0x1E9F);
       ecran.setTextColor(TFT_WHITE, 0x1E9F);
       ecran.setTextSize(2);
-      ecran.drawString("Detection", 120, 80);
-      ecran.setTextSize(1);
-      ecran.drawString("Scan I2C en cours...", 120, 140);
-      ecran.drawString("SHT35 + SCD40", 120, 165);
+      ecran.drawString("Scan I2C...", 120, 100);
       break;
 
-    // --- ATTENTE DONNÉES ---
     case ETAT_ATTENTE_DONNEES:
       ecran.fillScreen(0x1E9F);
       ecran.setTextColor(TFT_WHITE, 0x1E9F);
@@ -881,69 +891,68 @@ void afficherEcran(int e) {
       ecran.drawString("Validation plages", 120, 165);
       break;
 
-    // --- BUFFER : attente GO ---
     case ETAT_BUFFER:
       {
         ecran.fillScreen(0xFD20);
         ecran.setTextColor(TFT_BLACK, 0xFD20);
         ecran.setTextSize(2);
-        ecran.drawString("PRET", 120, 40);
+        ecran.drawString("PRET", 120, 30);
         ecran.setTextSize(1);
-        char buf[28];
-        snprintf(buf, sizeof(buf), "T: %.1f C", temperature);
-        ecran.drawString(buf, 120, 95);
-        snprintf(buf, sizeof(buf), "HR: %.1f %%", humidite);
-        ecran.drawString(buf, 120, 120);
-        snprintf(buf, sizeof(buf), "CO2: %.2f %%", co2);
-        ecran.drawString(buf, 120, 145);
-        ecran.setTextSize(1);
-        ecran.drawString("Fermez l'enceinte", 120, 185);
-        ecran.drawString("puis appuyez GO", 120, 205);
+        char buf[32];
+        snprintf(buf, sizeof(buf), "T:   %.1f C", temperature);
+        ecran.drawString(buf, 120, 90);
+        snprintf(buf, sizeof(buf), "HR:  %.1f %%", humidite);
+        ecran.drawString(buf, 120, 115);
+        snprintf(buf, sizeof(buf), "CO2: %.2f %% (fixe)", co2);
+        ecran.drawString(buf, 120, 140);
+        ecran.setTextColor(0x7BEF, 0xFD20);  // Gris pour indiquer CO2 inactif
+        ecran.drawString("CO2 desactive", 120, 160);
+        ecran.setTextColor(TFT_BLACK, 0xFD20);
+        ecran.drawString("Fermez l'enceinte", 120, 190);
+        ecran.drawString("puis appuyez GO", 120, 210);
         break;
       }
 
-    // --- MARCHE : régulation active ---
     case ETAT_MARCHE:
       {
         ecran.fillScreen(0x07E0);
         ecran.setTextColor(TFT_BLACK, 0x07E0);
         ecran.setTextSize(2);
-        ecran.drawString("EN MARCHE", 120, 25);
+        ecran.drawString("EN MARCHE", 120, 20);
         ecran.setTextSize(1);
         char ligne[32];
 
-        // Température avec indicateur visuel chaud/froid
-        const char* indT = (temperature < SEUIL_CHAUFFE) ? " [+]" : (temperature > SEUIL_REFROIDIT) ? " [-]"
-                                                                                                    : " [=]";
+        // Température avec indicateur [+]/[-]/[=]
+        const char* indT = (temperature < SEUIL_CHAUFFE)   ? " [+]" :
+                           (temperature > SEUIL_REFROIDIT)  ? " [-]" : " [=]";
         snprintf(ligne, sizeof(ligne), "T: %.1f/%.1f C%s",
                  temperature, CONSIGNE_TEMP, indT);
-        ecran.drawString(ligne, 120, 80);
+        ecran.drawString(ligne, 120, 75);
 
-        // Humidité avec alerte si nécessaire
+        // Humidité avec alerte
         if (alerteHR) {
           ecran.setTextColor(TFT_RED, 0x07E0);
           snprintf(ligne, sizeof(ligne), "HR: %.1f %% ALERTE", humidite);
         } else {
           snprintf(ligne, sizeof(ligne), "HR: %.1f %%", humidite);
         }
-        ecran.drawString(ligne, 120, 110);
+        ecran.drawString(ligne, 120, 105);
         ecran.setTextColor(TFT_BLACK, 0x07E0);
 
-        // CO₂ avec indicateur état injection
-        const char* indCO2 = (etatCO2 == CO2_INJECTING) ? " [INJ]" : (etatCO2 == CO2_STABILIZING) ? " [STB]"
-                                                                                                  : "";
-        snprintf(ligne, sizeof(ligne), "CO2: %.2f %%%s", co2, indCO2);
-        ecran.drawString(ligne, 120, 140);
+        // CO₂ — indiqué comme désactivé
+        ecran.setTextColor(0x39E7, 0x07E0);  // Vert foncé pour indiquer inactif
+        snprintf(ligne, sizeof(ligne), "CO2: %.2f %% [OFF]", co2);
+        ecran.drawString(ligne, 120, 135);
+        ecran.setTextColor(TFT_BLACK, 0x07E0);
 
         // État Peltier
-        const char* etatPeltier = (temperature < SEUIL_CHAUFFE) ? "Chauffe" : (temperature > SEUIL_REFROIDIT) ? "Refroidit"
-                                                                                                              : "Neutre";
+        const char* etatPeltier = (temperature < SEUIL_CHAUFFE)   ? "Chauffe" :
+                                  (temperature > SEUIL_REFROIDIT)  ? "Dissipe" : "Neutre";
         snprintf(ligne, sizeof(ligne), "Peltier: %s", etatPeltier);
-        ecran.drawString(ligne, 120, 175);
+        ecran.drawString(ligne, 120, 165);
         break;
       }
 
-    // --- ERREUR : état final ---
     case ETAT_ERREUR:
       ecran.fillScreen(TFT_RED);
       ecran.setTextColor(TFT_WHITE, TFT_RED);
