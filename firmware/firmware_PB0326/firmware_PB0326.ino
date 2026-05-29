@@ -1,28 +1,32 @@
 // =============================================================
 //  PB-0326 — Incubateur transportable pour cellules mammifères
 //  HEPIA HES-SO — Groupe 3 : Lyla Founas, Mattéo Pozzo di Borgo
-//  Version : 3.6 — Mai 2026
+//  Version : 3.7 — Mai 2026
 // =============================================================
 //
-//  MODIFICATIONS v3.6 :
-//    - Struct Bouton : suppression etatActuel et tempsFront (inutilisés)
-//    - mettreAJourBouton() : correction écrasement etatPrecedent
-//    - boutonAppuiLong() : utilise etatPrecedent au lieu de etatActuel
-//    - ETAT_PAUSE : appui long prioritaire sur appui court (else if)
-//      + annulation explicite appuiCourtValide si appui long déclenché
+//  MODIFICATIONS v3.7 :
+//    - Ajout LED I2C sur GPIO 4 :
+//        SHT35 détecté  → LED ON
+//        SHT35 absent   → LED OFF
+//        Mise à jour à chaque scan et à chaque lecture
+//    - Bug ETAT_CHECK_CAPTEURS : scan toutes les 2s (pas juste une fois)
+//        SHT35 disparaît après détection → ERREUR immédiate sans GO
+//    - Bug ETAT_ATTENTE_DONNEES : NaN → ERREUR immédiate sans GO
+//        + suppression code mort après break
+//    - toutEteindre() inclut maintenant LED_I2C OFF
 //
-//  MACHINE À ÉTATS v3.6 :
+//  MACHINE À ÉTATS v3.7 :
 //    0 - INIT            : splash 3s automatique
-//    1 - CHECK_CAPTEURS  : scan I2C + affichage + GO pour valider
+//    1 - CHECK_CAPTEURS  : scan I2C toutes les 2s + affichage
+//                          SHT35 OK → attente GO → ATTENTE_DONNEES
+//                          SHT35 absent au 1er scan → attente GO → ERREUR
+//                          SHT35 disparaît après détection → ERREUR immédiate
 //    2 - ATTENTE_DONNEES : lecture forcée + affichage + GO pour valider
+//                          NaN → ERREUR immédiate
 //    3 - BUFFER          : valeurs live + GO pour démarrer
-//    4 - MARCHE          : régulation active
-//                          GO maintenu 2s → PAUSE
-//    5 - PAUSE           : actionneurs OFF, valeurs live
-//                          GO court   → retour MARCHE
-//                          GO long 3s → retour BUFFER
-//    6 - ERREUR          : tout éteint, LED clignote
-//                          GO long 1s → ESP.restart()
+//    4 - MARCHE          : régulation active, GO 2s → PAUSE
+//    5 - PAUSE           : actionneurs OFF, GO court → MARCHE, GO 3s → BUFFER
+//    6 - ERREUR          : tout éteint, LED clignote, GO 1s → restart
 //
 // =============================================================
 
@@ -37,22 +41,23 @@
 //  EVITER: 6-11 (flash SPI), 34/35/36/39 (input only)
 //  EVITER: 13 (HSPI MOSI), 25/26 (DAC1/DAC2)
 // =============================================================
-#define BROCHE_PELTIER 32      // MOSFET Grove Peltier
-#define BROCHE_VENTILATEUR 14  // Ventilateur (Grove MOSFET)
-#define BROCHE_SOLENOIDE 27    // Électrovanne V114 — CO₂ DÉSACTIVÉ
-#define BROCHE_LED_ROUGE 19    // LED alerte erreur
-#define BROCHE_BOUTON_GO 5     // Bouton GO (INPUT_PULLUP)
+#define BROCHE_PELTIER      32  // MOSFET Grove Peltier
+#define BROCHE_VENTILATEUR  14  // Ventilateur (Grove MOSFET)
+#define BROCHE_SOLENOIDE    27  // Électrovanne V114 — CO₂ DÉSACTIVÉ
+#define BROCHE_LED_ROUGE    19  // LED alerte erreur
+#define BROCHE_LED_I2C       4  // LED verte capteurs I2C détectés
+#define BROCHE_BOUTON_GO     5  // Bouton GO (INPUT_PULLUP)
 
 // =============================================================
 //  CONSIGNES BIOLOGIQUES
 // =============================================================
-#define CONSIGNE_TEMP 37.0f
-#define SEUIL_CHAUFFE 36.5f
+#define CONSIGNE_TEMP   37.0f
+#define SEUIL_CHAUFFE   36.5f
 #define SEUIL_REFROIDIT 37.5f
-#define TEMP_SECURITE 40.0f
+#define TEMP_SECURITE   40.0f
 
-#define CONSIGNE_CO2 5.0f
-#define SEUIL_BAS_CO2 4.7f
+#define CONSIGNE_CO2   5.0f
+#define SEUIL_BAS_CO2  4.7f
 #define SEUIL_HAUT_CO2 5.3f
 
 #define SEUIL_HR_ALERTE 85.0f
@@ -60,47 +65,48 @@
 // =============================================================
 //  PARAMÈTRES CO₂ — conservés, non utilisés
 // =============================================================
-#define DUREE_INJECT_MS 200
+#define DUREE_INJECT_MS     200
 #define DUREE_STABILISATION 30000
-#define INTERVALLE_CO2 5000
+#define INTERVALLE_CO2      5000
 
 // =============================================================
 //  PARAMÈTRES DIVERS
 // =============================================================
-#define INTERVALLE_ECRAN 2000          // Refresh TFT (ms)
-#define INTERVALLE_LECTURE 2000        // Cadence lecture capteurs (ms)
-#define DUREE_INIT 3000                // Durée INIT (ms)
-#define DUREE_ANTIREBOND 50            // Anti-rebond bouton (ms)
-#define DUREE_APPUI_PAUSE 2000         // GO maintenu en MARCHE → PAUSE (ms)
+#define INTERVALLE_ECRAN         2000  // Refresh TFT (ms)
+#define INTERVALLE_LECTURE       2000  // Cadence lecture capteurs (ms)
+#define INTERVALLE_SCAN_I2C      2000  // Cadence scan I2C en CHECK_CAPTEURS (ms)
+#define DUREE_INIT               3000  // Durée INIT (ms)
+#define DUREE_ANTIREBOND           50  // Anti-rebond bouton (ms)
+#define DUREE_APPUI_PAUSE        2000  // GO maintenu en MARCHE → PAUSE (ms)
 #define DUREE_APPUI_BUFFER_PAUSE 3000  // GO maintenu en PAUSE → BUFFER (ms)
-#define DUREE_APPUI_RESET 1000         // GO maintenu en ERREUR → restart (ms)
-#define TENTATIVES_I2C 3
-#define DELAI_RETRY_I2C 50
-#define SEUIL_ERREURS_LECTURE 3  // NaN consécutifs → ERREUR
+#define DUREE_APPUI_RESET        1000  // GO maintenu en ERREUR → restart (ms)
+#define TENTATIVES_I2C              3
+#define DELAI_RETRY_I2C            50
+#define SEUIL_ERREURS_LECTURE       3  // NaN consécutifs → ERREUR en MARCHE
 
 // =============================================================
 //  ÉTATS MACHINE PRINCIPALE
 // =============================================================
-#define ETAT_INIT 0
-#define ETAT_CHECK_CAPTEURS 1
+#define ETAT_INIT            0
+#define ETAT_CHECK_CAPTEURS  1
 #define ETAT_ATTENTE_DONNEES 2
-#define ETAT_BUFFER 3
-#define ETAT_MARCHE 4
-#define ETAT_PAUSE 5
-#define ETAT_ERREUR 6
+#define ETAT_BUFFER          3
+#define ETAT_MARCHE          4
+#define ETAT_PAUSE           5
+#define ETAT_ERREUR          6
 
 // =============================================================
 //  ÉTATS THERMIQUES
 // =============================================================
-#define THERM_NEUTRE 0
+#define THERM_NEUTRE  0
 #define THERM_CHAUFFE 1
 #define THERM_DISSIPE 2
 
 // =============================================================
 //  ÉTATS CO₂ — conservés, inactifs
 // =============================================================
-#define CO2_IDLE 0
-#define CO2_INJECTING 1
+#define CO2_IDLE        0
+#define CO2_INJECTING   1
 #define CO2_STABILIZING 2
 
 // =============================================================
@@ -113,13 +119,13 @@
 //  COMMANDES SCD40 — DÉSACTIVÉES
 // =============================================================
 #define SCD40_CMD_START_MEAS 0x21B1
-#define SCD40_CMD_READ_MEAS 0xEC05
-#define SCD40_CMD_STOP_MEAS 0x3F86
+#define SCD40_CMD_READ_MEAS  0xEC05
+#define SCD40_CMD_STOP_MEAS  0x3F86
 
 // =============================================================
 //  OBJETS
 // =============================================================
-TFT_eSPI ecran = TFT_eSPI();
+TFT_eSPI       ecran = TFT_eSPI();
 Adafruit_SHT31 sht35 = Adafruit_SHT31();
 
 // =============================================================
@@ -127,97 +133,84 @@ Adafruit_SHT31 sht35 = Adafruit_SHT31();
 // =============================================================
 
 // --- Machine à états ---
-int etat = ETAT_INIT;
+int etat          = ETAT_INIT;
 int etatPrecedent = -1;
 
 // --- Valeurs capteurs ---
 float temperature = 25.0f;
-float humidite = 50.0f;
-float co2 = 5.0f;  // Valeur fixe — SCD40 désactivé
-                   // ⚠️ Remettre 0.0f quand SCD40 réactivé
+float humidite    = 50.0f;
+float co2         =  5.0f;  // Valeur fixe — SCD40 désactivé
+                             // ⚠️ Remettre 0.0f quand SCD40 réactivé
 
 // --- Timers ---
 unsigned long derniereLecture = 0;
-unsigned long dernierEcran = 0;
-unsigned long tempsInit = 0;
+unsigned long dernierEcran    = 0;
+unsigned long tempsInit       = 0;
+unsigned long dernierScanI2C  = 0;  // Timer scan périodique en CHECK_CAPTEURS
 
 // --- CO₂ ---
-int etatCO2 = CO2_IDLE;
-unsigned long timerCO2 = 0;
+int           etatCO2    = CO2_IDLE;
+unsigned long timerCO2   = 0;
 unsigned long dernierCO2 = 0;
 
 // --- Flags capteurs ---
 bool sht35Operationnel = false;
-bool co2Actif = false;  // ⚠️ true pour activer CO₂
-bool scd40Demarre = false;
-bool alerteHR = false;
+bool co2Actif          = false;  // ⚠️ true pour activer CO₂
+bool scd40Demarre      = false;
+bool alerteHR          = false;
 
 // --- Scan I2C ---
-bool scanEffectue = false;
-bool scanSHT35OK = false;
-bool scanSCD40OK = false;
+bool scanEffectue        = false;  // Premier scan effectué dans CHECK_CAPTEURS
+bool scanSHT35OK         = false;  // Résultat dernier scan SHT35
+bool scanSCD40OK         = false;  // Résultat dernier scan SCD40
+bool sht35DetecteUnesFois = false; // true dès que SHT35 détecté au moins une fois
+                                   // permet de distinguer "jamais vu" de "perdu"
 
 // --- Flag lecture forcée ATTENTE_DONNEES ---
 bool lectureInitialeEffectuee = false;
 
 // --- État thermique mémorisé ---
-// -1 = inconnu → force le premier digitalWrite à l'entrée en MARCHE
-int etatThermiqueActuel = -1;
+int etatThermiqueActuel = -1;  // -1 = force premier digitalWrite
 
 // --- Erreur one-shot ---
-// toutEteindre() appelé une seule fois à l'entrée de ETAT_ERREUR
 bool erreurInitialisee = false;
 
-// --- Détection perte capteur ---
+// --- Détection perte capteur en MARCHE ---
 uint8_t compteurErreursSHT35 = 0;
 
 // =============================================================
 //  STRUCTURE BOUTON — anti-rebond non bloquant
-//
-//  etatPrecedent     : état lu au dernier appel (true = pressé)
-//  appuiDetecte      : true entre front descendant et front montant
-//  tempsAppui        : horodatage du front descendant
-//  appuiCourtValide  : true si appui court validé, à consommer
-//
-//  boutonAppuiCourt()      → true une seule fois par appui court
-//  boutonAppuiLong(duree)  → true tant que bouton tenu >= duree ms
 // =============================================================
 struct Bouton {
-  bool etatPrecedent = false;
-  bool appuiDetecte = false;
-  unsigned long tempsAppui = 0;
-  bool appuiCourtValide = false;
+  bool          etatPrecedent    = false;
+  bool          appuiDetecte     = false;
+  unsigned long tempsAppui       = 0;
+  bool          appuiCourtValide = false;
 } bouton;
 
-// =============================================================
-//  MISE À JOUR BOUTON — appeler en début de loop()
-// =============================================================
 void mettreAJourBouton() {
   bool lu = (digitalRead(BROCHE_BOUTON_GO) == LOW);
 
   // Front descendant : relâché → pressé
   if (lu && !bouton.etatPrecedent) {
-    bouton.tempsAppui = millis();
-    bouton.appuiDetecte = true;
+    bouton.tempsAppui       = millis();
+    bouton.appuiDetecte     = true;
     bouton.appuiCourtValide = false;
   }
 
   // Front montant : pressé → relâché
   if (!lu && bouton.etatPrecedent) {
-    // Appui court : >= antirebond ET < seuil long (2s)
-    if (bouton.appuiDetecte && (millis() - bouton.tempsAppui) >= DUREE_ANTIREBOND && (millis() - bouton.tempsAppui) < DUREE_APPUI_PAUSE) {
+    if (bouton.appuiDetecte &&
+        (millis() - bouton.tempsAppui) >= DUREE_ANTIREBOND &&
+        (millis() - bouton.tempsAppui) <  DUREE_APPUI_PAUSE) {
       bouton.appuiCourtValide = true;
     }
     bouton.appuiDetecte = false;
   }
 
-  // Mise à jour état précédent APRÈS détection des fronts
   bouton.etatPrecedent = lu;
 }
 
-// =============================================================
-//  BOUTON APPUI COURT — consommable (retourne true une seule fois)
-// =============================================================
 bool boutonAppuiCourt() {
   if (bouton.appuiCourtValide) {
     bouton.appuiCourtValide = false;
@@ -226,11 +219,20 @@ bool boutonAppuiCourt() {
   return false;
 }
 
-// =============================================================
-//  BOUTON APPUI LONG — non consommable, true tant que tenu >= duree
-// =============================================================
 bool boutonAppuiLong(unsigned long duree) {
-  return bouton.etatPrecedent && bouton.appuiDetecte && (millis() - bouton.tempsAppui) >= duree;
+  return bouton.etatPrecedent &&
+         bouton.appuiDetecte  &&
+         (millis() - bouton.tempsAppui) >= duree;
+}
+
+// =============================================================
+//  MISE À JOUR LED I2C
+//
+//  Allumée si SHT35 détecté, éteinte sinon.
+//  Appelée après chaque scan et après chaque lecture capteur.
+// =============================================================
+void mettreAJourLedI2C() {
+  digitalWrite(BROCHE_LED_I2C, sht35Operationnel ? HIGH : LOW);
 }
 
 // =============================================================
@@ -238,43 +240,34 @@ bool boutonAppuiLong(unsigned long duree) {
 // =============================================================
 void setup() {
   Serial.begin(115200);
-  Serial.println("=== PB-0326 Firmware v3.6 ===");
+  Serial.println("=== PB-0326 Firmware v3.7 ===");
 
-  // Broches sorties
-  pinMode(BROCHE_PELTIER, OUTPUT);
+  pinMode(BROCHE_PELTIER,     OUTPUT);
   pinMode(BROCHE_VENTILATEUR, OUTPUT);
-  pinMode(BROCHE_SOLENOIDE, OUTPUT);
-  pinMode(BROCHE_LED_ROUGE, OUTPUT);
+  pinMode(BROCHE_SOLENOIDE,   OUTPUT);
+  pinMode(BROCHE_LED_ROUGE,   OUTPUT);
+  pinMode(BROCHE_LED_I2C,     OUTPUT);
+  pinMode(BROCHE_BOUTON_GO,   INPUT_PULLUP);
 
-  // Broche entrée
-  pinMode(BROCHE_BOUTON_GO, INPUT_PULLUP);
-
-  // Sécurité initiale — après pinMode
   toutEteindre();
 
-  // Bus I2C
   Wire.begin(21, 22);
   delay(100);
 
-  // SHT35
   sht35Demarrer();
+  mettreAJourLedI2C();
 
   // SCD40 : DÉSACTIVÉ
   // scd40Demarrer();
   // delay(5000);
 
   // Écran TFT ST7789V3 240x280
-  // Broches configurées dans User_Setup.h :
-  //   ST7789_DRIVER, TFT_WIDTH 240, TFT_HEIGHT 280
-  //   MOSI=23, SCLK=18, CS=15, DC=2, RST=33
-  //   TFT_RGB_ORDER TFT_RGB, TFT_INVERSION_ON
-  //   SPI_FREQUENCY 40000000
+  // User_Setup.h : ST7789_DRIVER, 240x280, MOSI=23, SCLK=18, CS=15, DC=2, RST=33
   ecran.init();
   ecran.setRotation(0);
   ecran.fillScreen(TFT_BLACK);
   ecran.setTextDatum(MC_DATUM);
 
-  // Test écran blanc 500ms — confirme que l'init fonctionne
   ecran.fillScreen(TFT_WHITE);
   delay(500);
   ecran.fillScreen(TFT_BLACK);
@@ -284,11 +277,10 @@ void setup() {
 }
 
 // =============================================================
-//  LOOP — Machine à états principale
+//  LOOP
 // =============================================================
 void loop() {
 
-  // Mise à jour bouton en premier — avant toute logique
   mettreAJourBouton();
 
   // Lecture capteurs cadencée toutes les 2s
@@ -301,9 +293,12 @@ void loop() {
   if (etat != etatPrecedent) {
     afficherEcran(etat);
     etatPrecedent = etat;
-    if (etat != ETAT_CHECK_CAPTEURS) scanEffectue = false;
+    if (etat != ETAT_CHECK_CAPTEURS) {
+      scanEffectue         = false;
+      sht35DetecteUnesFois = false;
+    }
     if (etat != ETAT_ATTENTE_DONNEES) lectureInitialeEffectuee = false;
-    if (etat != ETAT_ERREUR) erreurInitialisee = false;
+    if (etat != ETAT_ERREUR)          erreurInitialisee        = false;
     Serial.printf("[ÉTAT] → %d\n", etat);
   }
 
@@ -311,7 +306,6 @@ void loop() {
 
     // ----------------------------------------------------------
     //  ÉTAT 0 — INIT
-    //  Splash screen 3s automatique
     // ----------------------------------------------------------
     case ETAT_INIT:
       if (millis() - tempsInit >= DUREE_INIT) {
@@ -321,18 +315,45 @@ void loop() {
 
     // ----------------------------------------------------------
     //  ÉTAT 1 — CHECK CAPTEURS
-    //  Scan I2C automatique une fois à l'entrée
-    //  Résultat affiché, attente GO
-    //    SHT35 OK  → ATTENTE_DONNEES
-    //    SHT35 KO  → ERREUR
+    //
+    //  Scan I2C toutes les 2s, résultat affiché en continu.
+    //
+    //  Comportement selon résultat :
+    //    Jamais détecté : affiche ABSENT + instruction GO → ERREUR
+    //    Détecté         : affiche OK + instruction GO → ATTENTE_DONNEES
+    //    Détecté puis perdu (entre deux scans) : ERREUR immédiate sans GO
+    //      → empêche l'opérateur de continuer avec un capteur instable
     // ----------------------------------------------------------
     case ETAT_CHECK_CAPTEURS:
-      if (!scanEffectue) {
+
+      // Scan périodique toutes les 2s
+      if (!scanEffectue ||
+          (millis() - dernierScanI2C >= INTERVALLE_SCAN_I2C)) {
         verifierCapteursI2C();
-        scanEffectue = true;
+        dernierScanI2C = millis();
+
+        if (!scanEffectue) {
+          scanEffectue = true;
+          Serial.println("[CHECK] Premier scan effectué");
+        }
+
+        // SHT35 détecté pour la première fois
+        if (scanSHT35OK && !sht35DetecteUnesFois) {
+          sht35DetecteUnesFois = true;
+          Serial.println("[CHECK] SHT35 détecté pour la première fois");
+        }
+
+        // SHT35 était détecté et a disparu → ERREUR immédiate
+        if (!scanSHT35OK && sht35DetecteUnesFois) {
+          Serial.println("[CHECK] SHT35 perdu → ERREUR immédiate");
+          signalerErreur("SHT35 perdu");
+          break;
+        }
+
         Serial.println("[CHECK] GO pour continuer");
       }
 
+      // Attente GO — décision selon dernier résultat scan
       if (boutonAppuiCourt()) {
         if (scanSHT35OK) {
           etat = ETAT_ATTENTE_DONNEES;
@@ -342,25 +363,35 @@ void loop() {
       }
       break;
 
-      // ----------------------------------------------------------
-      //  ÉTAT 2 — ATTENTE DONNÉES
-      //  Lecture capteur forcée dès l'entrée (pas d'attente 2s)
-      //  Valeurs affichées avec indicateur OK / INVALIDES
-      //  GO → BUFFER si valeurs plausibles
-      //  GO → ERREUR si valeurs invalides
-      // ----------------------------------------------------------
+    // ----------------------------------------------------------
+    //  ÉTAT 2 — ATTENTE DONNÉES
+    //
+    //  Lecture forcée à l'entrée (valeurs mises à NAN avant lecture).
+    //  Rafraîchissement toutes les 2s.
+    //  NaN détecté → ERREUR immédiate (capteur instable ou débranché).
+    //  GO → BUFFER si valeurs valides.
+    //  GO → ERREUR si valeurs invalides.
+    // ----------------------------------------------------------
     case ETAT_ATTENTE_DONNEES:
-      // Lecture forcée à l'entrée, une seule fois
+
+      // Lecture forcée à l'entrée
       if (!lectureInitialeEffectuee) {
-        // Remettre les valeurs à NaN pour forcer une vraie validation
         temperature = NAN;
-        humidite = NAN;
+        humidite    = NAN;
         lireCapteurs();
-        derniereLecture = millis();
+        derniereLecture          = millis();
         lectureInitialeEffectuee = true;
         afficherEcran(ETAT_ATTENTE_DONNEES);
         Serial.printf("[DONNÉES] T=%.1f HR=%.1f — GO pour valider\n",
                       temperature, humidite);
+      }
+
+      // NaN en ATTENTE_DONNEES → ERREUR immédiate
+      // (capteur répondait au scan I2C mais ne donne pas de données valides)
+      if (isnan(temperature) || isnan(humidite)) {
+        Serial.println("[DONNÉES] NaN détecté → ERREUR immédiate");
+        signalerErreur("SHT35 NaN");
+        break;
       }
 
       // Rafraîchissement toutes les 2s
@@ -371,34 +402,11 @@ void loop() {
         dernierEcran = millis();
       }
 
+      // GO → validation manuelle
       if (boutonAppuiCourt()) {
-        // Validation sur valeurs réellement lues (NAN si lecture échouée)
-        if (!isnan(temperature) && !isnan(humidite) && temperature > 10.0f && temperature < 45.0f && humidite > 0.0f) {
-          Serial.println("[DONNÉES] OK → BUFFER");
-          etat = ETAT_BUFFER;
-        } else {
-          Serial.printf("[DONNÉES] Invalides T=%.1f HR=%.1f → ERREUR\n",
-                        temperature, humidite);
-          signalerErreur("Donnees invalides");
-        }
-      }
-      break;
-      if (!lectureInitialeEffectuee) {
-        lireCapteurs();
-        derniereLecture = millis();
-        lectureInitialeEffectuee = true;
-        afficherEcran(ETAT_ATTENTE_DONNEES);
-        Serial.printf("[DONNÉES] T=%.1f HR=%.1f — GO pour valider\n",
-                      temperature, humidite);
-      }
-
-      if (millis() - dernierEcran >= INTERVALLE_ECRAN) {
-        afficherEcran(ETAT_ATTENTE_DONNEES);
-        dernierEcran = millis();
-      }
-
-      if (boutonAppuiCourt()) {
-        if (temperature > 10.0f && temperature < 45.0f && humidite > 0.0f) {
+        if (!isnan(temperature) && !isnan(humidite) &&
+            temperature > 10.0f  && temperature < 45.0f &&
+            humidite    > 0.0f) {
           Serial.println("[DONNÉES] OK → BUFFER");
           etat = ETAT_BUFFER;
         } else {
@@ -411,8 +419,6 @@ void loop() {
 
     // ----------------------------------------------------------
     //  ÉTAT 3 — BUFFER
-    //  Valeurs live, opérateur ferme l'enceinte
-    //  GO court → MARCHE
     // ----------------------------------------------------------
     case ETAT_BUFFER:
       if (millis() - dernierEcran >= INTERVALLE_ECRAN) {
@@ -422,19 +428,17 @@ void loop() {
 
       if (boutonAppuiCourt()) {
         Serial.println("[BUFFER] GO → MARCHE");
-        dernierCO2 = millis();
-        dernierEcran = millis();
-        etatCO2 = CO2_IDLE;
+        dernierCO2           = millis();
+        dernierEcran         = millis();
+        etatCO2              = CO2_IDLE;
         compteurErreursSHT35 = 0;
-        etatThermiqueActuel = -1;
-        etat = ETAT_MARCHE;
+        etatThermiqueActuel  = -1;
+        etat                 = ETAT_MARCHE;
       }
       break;
 
     // ----------------------------------------------------------
     //  ÉTAT 4 — MARCHE
-    //  Régulation active température + humidité
-    //  GO maintenu 2s → PAUSE
     // ----------------------------------------------------------
     case ETAT_MARCHE:
       if (temperature >= TEMP_SECURITE) {
@@ -459,17 +463,10 @@ void loop() {
 
     // ----------------------------------------------------------
     //  ÉTAT 5 — PAUSE
-    //  Actionneurs OFF, valeurs live affichées
-    //  Permet ouverture enceinte sans déclencher ERREUR
-    //  NaN comptés mais pas de ERREUR (ouverture intentionnelle)
-    //
-    //  GO long 3s → BUFFER  (prioritaire — testé en premier)
-    //  GO court   → MARCHE  (seulement si pas appui long)
     // ----------------------------------------------------------
     case ETAT_PAUSE:
-      // Extinction actionneurs une seule fois à l'entrée
       if (etatThermiqueActuel != THERM_NEUTRE) {
-        digitalWrite(BROCHE_PELTIER, LOW);
+        digitalWrite(BROCHE_PELTIER,     LOW);
         digitalWrite(BROCHE_VENTILATEUR, LOW);
         etatThermiqueActuel = THERM_NEUTRE;
         Serial.println("[PAUSE] Actionneurs OFF");
@@ -480,30 +477,27 @@ void loop() {
         dernierEcran = millis();
       }
 
-      // Appui long 3s → BUFFER (prioritaire sur appui court)
+      // Appui long 3s → BUFFER (prioritaire)
       if (boutonAppuiLong(DUREE_APPUI_BUFFER_PAUSE)) {
         Serial.println("[PAUSE] GO 3s → BUFFER");
-        bouton.appuiCourtValide = false;  // Annule appui court simultané
-        etatThermiqueActuel = -1;
-        compteurErreursSHT35 = 0;
-        dernierEcran = millis();
-        etat = ETAT_BUFFER;
+        bouton.appuiCourtValide = false;
+        etatThermiqueActuel     = -1;
+        compteurErreursSHT35    = 0;
+        dernierEcran            = millis();
+        etat                    = ETAT_BUFFER;
 
-        // Appui court → MARCHE (seulement si pas appui long)
+      // Appui court → MARCHE
       } else if (boutonAppuiCourt()) {
         Serial.println("[PAUSE] GO → MARCHE");
-        etatThermiqueActuel = -1;
+        etatThermiqueActuel  = -1;
         compteurErreursSHT35 = 0;
-        dernierEcran = millis();
-        etat = ETAT_MARCHE;
+        dernierEcran         = millis();
+        etat                 = ETAT_MARCHE;
       }
       break;
 
     // ----------------------------------------------------------
     //  ÉTAT 6 — ERREUR
-    //  toutEteindre() one-shot à l'entrée
-    //  LED rouge clignote toutes les 500ms
-    //  GO maintenu 1s → ESP.restart()
     // ----------------------------------------------------------
     case ETAT_ERREUR:
       if (!erreurInitialisee) {
@@ -514,9 +508,9 @@ void loop() {
 
       {
         static unsigned long dernierBlink = 0;
-        static bool ledActive = false;
+        static bool          ledActive    = false;
         if (millis() - dernierBlink >= 500) {
-          ledActive = !ledActive;
+          ledActive    = !ledActive;
           digitalWrite(BROCHE_LED_ROUGE, ledActive ? HIGH : LOW);
           dernierBlink = millis();
         }
@@ -545,7 +539,7 @@ void sht35Demarrer() {
 }
 
 // =============================================================
-//  SCD40 — DÉSACTIVÉ (conservé pour réactivation)
+//  SCD40 — DÉSACTIVÉ
 //
 //  Pour réactiver :
 //    1. Décommenter corps scd40EnvoyerCommande() et scd40Demarrer()
@@ -611,9 +605,9 @@ bool scd40Lire(float& co2_out, float& temp_out, float& hum_out) {
 //
 //  Détection perte capteur à chaud :
 //    NaN consécutifs → compteurErreursSHT35++
-//    Lecture valide  → compteur = 0
-//    3 NaN consécutifs en MARCHE → signalerErreur (6s de tolérance)
-//    En PAUSE : NaN comptés mais pas de ERREUR (ouverture intentionnelle)
+//    Lecture valide  → compteur = 0 + LED I2C ON
+//    3 NaN en MARCHE → signalerErreur (6s de tolérance)
+//    En PAUSE        → NaN comptés mais pas de ERREUR
 // =============================================================
 void lireCapteurs() {
   if (sht35Operationnel) {
@@ -621,9 +615,10 @@ void lireCapteurs() {
     float h = sht35.readHumidity();
 
     if (!isnan(t) && !isnan(h)) {
-      temperature = t;
-      humidite = h;
+      temperature          = t;
+      humidite             = h;
       compteurErreursSHT35 = 0;
+      mettreAJourLedI2C();  // LED ON — capteur répond
       Serial.printf("[SHT35] T=%.1fC  HR=%.1f%%\n", temperature, humidite);
     } else {
       compteurErreursSHT35++;
@@ -645,14 +640,14 @@ void lireCapteurs() {
 }
 
 // =============================================================
-//  SCAN I2C — tentatives multiples
+//  SCAN I2C
 // =============================================================
 bool scannerAdresse(uint8_t adresse, uint8_t tentatives) {
   for (uint8_t i = 0; i < tentatives; i++) {
     Wire.beginTransmission(adresse);
     uint8_t erreur = Wire.endTransmission();
     if (erreur == 0) return true;
-    Serial.printf("[I2C] %d/%d 0x%02X err=%d\n", i + 1, tentatives, adresse, erreur);
+    Serial.printf("[I2C] %d/%d 0x%02X err=%d\n", i+1, tentatives, adresse, erreur);
     if (i < tentatives - 1) delay(DELAI_RETRY_I2C);
   }
   return false;
@@ -660,18 +655,19 @@ bool scannerAdresse(uint8_t adresse, uint8_t tentatives) {
 
 // =============================================================
 //  VÉRIFICATION CAPTEURS I2C
+//  Met à jour scanSHT35OK, sht35Operationnel, LED I2C
 // =============================================================
 void verifierCapteursI2C() {
   Serial.println("[I2C] Scan...");
 
-  scanSHT35OK = scannerAdresse(ADRESSE_SHT35, TENTATIVES_I2C);
+  scanSHT35OK       = scannerAdresse(ADRESSE_SHT35, TENTATIVES_I2C);
   sht35Operationnel = scanSHT35OK;
+  mettreAJourLedI2C();  // LED ON si détecté, OFF si absent
   Serial.printf("[I2C] SHT35 → %s\n", scanSHT35OK ? "OK" : "ABSENT");
 
   // ⚠️ DÉSACTIVÉ — SCD40
   // scanSCD40OK = scannerAdresse(ADRESSE_SCD40, TENTATIVES_I2C);
   // if (scanSCD40OK) co2Actif = true;
-  // Serial.printf("[I2C] SCD40 → %s\n", scanSCD40OK ? "OK" : "ABSENT");
   scanSCD40OK = false;
 
   afficherResultatI2C(scanSHT35OK, scanSCD40OK);
@@ -681,15 +677,14 @@ void verifierCapteursI2C() {
 //  RÉGULATION THERMIQUE — état mémorisé
 //
 //  digitalWrite émis UNIQUEMENT au changement d'état thermique.
-//  Élimine les transitoires répétitifs qui perturbaient le bus I2C.
 //
 //  T < 36.5°C  → THERM_CHAUFFE : Peltier ON  + Ventilateur ON
 //  T > 37.5°C  → THERM_DISSIPE : Peltier OFF + Ventilateur ON
-//  Zone neutre → THERM_NEUTRE  : Peltier OFF + Ventilateur OFF
+//  Zone neutre → THERM_NEUTRE  : tout OFF
 // =============================================================
 void regulerTemperature() {
-  int nouvelEtat = (temperature < SEUIL_CHAUFFE) ? THERM_CHAUFFE : (temperature > SEUIL_REFROIDIT) ? THERM_DISSIPE
-                                                                                                   : THERM_NEUTRE;
+  int nouvelEtat = (temperature < SEUIL_CHAUFFE)  ? THERM_CHAUFFE :
+                  (temperature > SEUIL_REFROIDIT) ? THERM_DISSIPE : THERM_NEUTRE;
 
   if (nouvelEtat == etatThermiqueActuel) return;
 
@@ -697,17 +692,17 @@ void regulerTemperature() {
 
   switch (nouvelEtat) {
     case THERM_CHAUFFE:
-      digitalWrite(BROCHE_PELTIER, HIGH);
+      digitalWrite(BROCHE_PELTIER,     HIGH);
       digitalWrite(BROCHE_VENTILATEUR, HIGH);
       Serial.printf("[THERM] → Chauffe  T=%.1fC\n", temperature);
       break;
     case THERM_DISSIPE:
-      digitalWrite(BROCHE_PELTIER, LOW);
+      digitalWrite(BROCHE_PELTIER,     LOW);
       digitalWrite(BROCHE_VENTILATEUR, HIGH);
       Serial.printf("[THERM] → Dissipe  T=%.1fC\n", temperature);
       break;
     case THERM_NEUTRE:
-      digitalWrite(BROCHE_PELTIER, LOW);
+      digitalWrite(BROCHE_PELTIER,     LOW);
       digitalWrite(BROCHE_VENTILATEUR, LOW);
       Serial.printf("[THERM] → Neutre   T=%.1fC\n", temperature);
       break;
@@ -715,7 +710,7 @@ void regulerTemperature() {
 }
 
 // =============================================================
-//  RÉGULATION CO₂ — DÉSACTIVÉE (co2Actif = false)
+//  RÉGULATION CO₂ — DÉSACTIVÉE
 // =============================================================
 void miseAJourCO2() {
   if (!co2Actif) return;  // ⚠️ DÉSACTIVÉ
@@ -728,7 +723,7 @@ void miseAJourCO2() {
         if (co2 < SEUIL_BAS_CO2) {
           digitalWrite(BROCHE_SOLENOIDE, HIGH);
           timerCO2 = maintenant;
-          etatCO2 = CO2_INJECTING;
+          etatCO2  = CO2_INJECTING;
           Serial.printf("[CO2] Injection (%.2f%%)\n", co2);
         }
       }
@@ -737,7 +732,7 @@ void miseAJourCO2() {
       if (maintenant - timerCO2 >= DUREE_INJECT_MS) {
         digitalWrite(BROCHE_SOLENOIDE, LOW);
         timerCO2 = maintenant;
-        etatCO2 = CO2_STABILIZING;
+        etatCO2  = CO2_STABILIZING;
         Serial.println("[CO2] Vanne fermée → stabilisation");
       }
       break;
@@ -771,10 +766,11 @@ void miseAJourHumidite() {
 //  TOUT ÉTEINDRE
 // =============================================================
 void toutEteindre() {
-  digitalWrite(BROCHE_PELTIER, LOW);
+  digitalWrite(BROCHE_PELTIER,     LOW);
   digitalWrite(BROCHE_VENTILATEUR, LOW);
-  digitalWrite(BROCHE_SOLENOIDE, LOW);
-  digitalWrite(BROCHE_LED_ROUGE, LOW);
+  digitalWrite(BROCHE_SOLENOIDE,   LOW);
+  digitalWrite(BROCHE_LED_ROUGE,   LOW);
+  digitalWrite(BROCHE_LED_I2C,     LOW);  // LED I2C OFF en erreur
   etatThermiqueActuel = -1;
 }
 
@@ -785,7 +781,7 @@ void signalerErreur(const char* message) {
   Serial.printf("[ERREUR] %s\n", message);
   toutEteindre();
   compteurErreursSHT35 = 0;
-  erreurInitialisee = false;
+  erreurInitialisee    = false;
   etat = ETAT_ERREUR;
   afficherEcran(ETAT_ERREUR);
 }
@@ -804,8 +800,7 @@ void afficherResultatI2C(bool sht35_ok, bool scd40_ok) {
   ecran.setTextSize(1);
   ecran.setTextColor(sht35_ok ? TFT_GREEN : TFT_RED, 0x1E9F);
   ecran.drawString(sht35_ok ? "SHT35 [0x44]  OK"
-                            : "SHT35 [0x44]  ABSENT",
-                   120, 80);
+                            : "SHT35 [0x44]  ABSENT", 120, 80);
 
   ecran.setTextColor(0xC618, 0x1E9F);
   ecran.drawString("SCD40 [0x62]  DESACTIVE", 120, 105);
@@ -817,22 +812,12 @@ void afficherResultatI2C(bool sht35_ok, bool scd40_ok) {
   ecran.setTextSize(1);
   ecran.setTextColor(TFT_WHITE, 0x1E9F);
   ecran.drawString(sht35_ok ? "GO pour continuer"
-                            : "GO → ERREUR",
-                   120, 210);
+                            : "GO → ERREUR", 120, 210);
 }
 
 // =============================================================
 //  AFFICHAGE ÉCRAN TFT — dispatcher
 //  240 × 280 px portrait — centre x = 120
-//
-//  Couleurs :
-//    INIT            : bleu marine  TFT_NAVY
-//    CHECK_CAPTEURS  : bleu-vert    0x1E9F
-//    ATTENTE_DONNEES : bleu-vert    0x1E9F
-//    BUFFER          : orange       0xFD20
-//    MARCHE          : vert         0x07E0
-//    PAUSE           : orange foncé 0xFC60
-//    ERREUR          : rouge        TFT_RED
 // =============================================================
 void afficherEcran(int e) {
   ecran.fillScreen(TFT_BLACK);
@@ -840,7 +825,6 @@ void afficherEcran(int e) {
 
   switch (e) {
 
-    // --- INIT ---
     case ETAT_INIT:
       ecran.fillScreen(TFT_NAVY);
       ecran.setTextColor(TFT_WHITE, TFT_NAVY);
@@ -852,15 +836,14 @@ void afficherEcran(int e) {
       ecran.drawString("Initialisation...", 120, 185);
       break;
 
-    // --- CHECK CAPTEURS (provisoire pendant scan) ---
     case ETAT_CHECK_CAPTEURS:
+      // Provisoire — remplacé par afficherResultatI2C() après scan
       ecran.fillScreen(0x1E9F);
       ecran.setTextColor(TFT_WHITE, 0x1E9F);
       ecran.setTextSize(2);
       ecran.drawString("Scan I2C...", 120, 130);
       break;
 
-    // --- ATTENTE DONNÉES ---
     case ETAT_ATTENTE_DONNEES:
       {
         ecran.fillScreen(0x1E9F);
@@ -876,19 +859,19 @@ void afficherEcran(int e) {
         snprintf(buf, sizeof(buf), "HR: %.1f %%", humidite);
         ecran.drawString(buf, 120, 125);
 
-        bool valide = (temperature > 10.0f && temperature < 45.0f && humidite > 0.0f);
+        bool valide = (!isnan(temperature) && !isnan(humidite) &&
+                       temperature > 10.0f  && temperature < 45.0f &&
+                       humidite    > 0.0f);
         ecran.setTextColor(valide ? TFT_GREEN : TFT_RED, 0x1E9F);
         ecran.drawString(valide ? "Valeurs OK" : "Valeurs INVALIDES", 120, 165);
 
         ecran.setTextColor(TFT_WHITE, 0x1E9F);
         ecran.drawString(valide ? "GO pour continuer"
-                                : "GO → ERREUR",
-                         120, 215);
+                                : "GO → ERREUR", 120, 215);
         ecran.drawString("(verifier capteur si invalide)", 120, 235);
         break;
       }
 
-    // --- BUFFER ---
     case ETAT_BUFFER:
       {
         ecran.fillScreen(0xFD20);
@@ -914,7 +897,6 @@ void afficherEcran(int e) {
         break;
       }
 
-    // --- MARCHE ---
     case ETAT_MARCHE:
       {
         ecran.fillScreen(0x07E0);
@@ -925,8 +907,8 @@ void afficherEcran(int e) {
         char ligne[32];
 
         const char* indT =
-          (etatThermiqueActuel == THERM_CHAUFFE) ? " [+]" : (etatThermiqueActuel == THERM_DISSIPE) ? " [-]"
-                                                                                                   : " [=]";
+          (etatThermiqueActuel == THERM_CHAUFFE) ? " [+]" :
+          (etatThermiqueActuel == THERM_DISSIPE) ? " [-]" : " [=]";
         snprintf(ligne, sizeof(ligne), "T: %.1f/%.1f C%s",
                  temperature, CONSIGNE_TEMP, indT);
         ecran.drawString(ligne, 120, 80);
@@ -946,8 +928,8 @@ void afficherEcran(int e) {
         ecran.setTextColor(TFT_BLACK, 0x07E0);
 
         const char* labelTherm =
-          (etatThermiqueActuel == THERM_CHAUFFE) ? "Chauffe + ventil" : (etatThermiqueActuel == THERM_DISSIPE) ? "Dissipe (ventil)"
-                                                                                                               : "Neutre";
+          (etatThermiqueActuel == THERM_CHAUFFE) ? "Chauffe + ventil" :
+          (etatThermiqueActuel == THERM_DISSIPE) ? "Dissipe (ventil)" : "Neutre";
         ecran.drawString(labelTherm, 120, 164);
 
         if (compteurErreursSHT35 > 0) {
@@ -962,7 +944,6 @@ void afficherEcran(int e) {
         break;
       }
 
-    // --- PAUSE ---
     case ETAT_PAUSE:
       {
         ecran.fillScreen(0xFC60);
@@ -991,7 +972,6 @@ void afficherEcran(int e) {
         break;
       }
 
-    // --- ERREUR ---
     case ETAT_ERREUR:
       ecran.fillScreen(TFT_RED);
       ecran.setTextColor(TFT_WHITE, TFT_RED);
