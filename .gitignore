@@ -1,0 +1,43 @@
+# Système
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Arduino / PlatformIO
+build/
+.pio/
+*.bin
+*.elf
+
+# KiCad : sauvegardes et verrous
+*-backups/
+_autosave-*
+~*.lck
+*.kicad_prl
+fp-info-cache
+.history/
+
+# Creo : fichiers de session et versions numérotées
+trail.txt*
+*.crc
+*.prt.[0-9]*
+*.asm.[0-9]*
+
+# Inventor : anciennes versions
+OldVersions/
+
+# LaTeX : fichiers générés
+*.aux
+*.log
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# Python
+__pycache__/
+
+# Exécutables (ne jamais publier)
+*.exe
+*.bat
